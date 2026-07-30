@@ -212,6 +212,33 @@ def get_read_info(bookId):
     }
 
 
+def get_read_properties(bookId):
+    if not has_any_property(("状态", "阅读时长", "阅读进度", "时间")):
+        return {}
+
+    read_info = get_read_info(bookId=bookId)
+    reading_time = read_info.get("readingTime", 0)
+    format_time = ""
+    hour = reading_time // 3600
+    if hour > 0:
+        format_time += f"{hour}时"
+    minutes = reading_time % 3600 // 60
+    if minutes > 0:
+        format_time += f"{minutes}分"
+
+    raw_properties = {
+        "状态": "读完" if read_info.get("markedStatus") == 4 else "在读",
+        "阅读时长": format_time,
+        "阅读进度": read_info.get("readingProgress", 0),
+    }
+    finished_date = read_info.get("finishedDate")
+    if finished_date:
+        raw_properties["时间"] = datetime.utcfromtimestamp(finished_date).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    return raw_properties
+
+
 def normalize_reading_progress(value):
     value = to_number(value) or 0
     if value > 1:
@@ -302,31 +329,7 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
     }
     if categories != None:
         raw_properties["分类"] = categories
-    read_info = (
-        get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
-        else None
-    )
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
-        raw_properties["阅读时长"] = format_time
-        raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+    raw_properties.update(get_read_properties(bookId))
 
     properties = build_notion_properties(raw_properties)
     icon = get_icon(cover)
@@ -585,6 +588,62 @@ def query_data_source(**body):
     )
 
 
+def query_all_data_source(**body):
+    query_body = dict(body)
+    results = []
+    while True:
+        response = query_data_source(**query_body)
+        results.extend(response.get("results") or [])
+        if not response.get("has_more"):
+            return results
+        query_body["start_cursor"] = response.get("next_cursor")
+
+
+def get_property_text_value(property_value):
+    if not property_value:
+        return ""
+    prop_type = property_value.get("type")
+    value = property_value.get(prop_type)
+    if prop_type in {"title", "rich_text"}:
+        return "".join(item.get("plain_text", "") for item in (value or []))
+    if prop_type == "number":
+        number = to_number(value)
+        if number is None:
+            return ""
+        if isinstance(number, float) and number.is_integer():
+            return str(int(number))
+        return str(number)
+    if prop_type in {"select", "status"} and value:
+        return str(value.get("name") or "")
+    if prop_type == "url":
+        return str(value or "")
+    return ""
+
+
+def get_unfinished_page_ids():
+    if not has_any_property(("状态",)) or "BookId" not in data_source_property_types:
+        return {}
+    pages = query_all_data_source(
+        filter=build_equals_filter("状态", "在读"),
+        page_size=100,
+    )
+    page_ids = {}
+    for page in pages:
+        book_id = get_property_text_value(
+            (page.get("properties") or {}).get("BookId")
+        )
+        if book_id and page.get("id"):
+            page_ids[book_id] = page["id"]
+    return page_ids
+
+
+def update_existing_read_info(page_id, bookId):
+    properties = build_notion_properties(get_read_properties(bookId))
+    if not properties:
+        return
+    client.pages.update(page_id=page_id, properties=properties)
+
+
 def load_data_source_schema():
     """读取当前 data source 的真实属性，只强制要求同步游标需要的字段。"""
     global data_source_property_types, title_property_name, skipped_property_names
@@ -797,18 +856,23 @@ def sync():
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
     latest_sort = get_sort()
+    unfinished_page_ids = get_unfinished_page_ids()
     books = get_notebooklist()
     if books != None:
         for index, book in enumerate(books):
             sort = book["sort"]
-            if sort <= latest_sort:
-                continue
             book = book.get("book") or book
             title = book.get("title") or ""
             cover = (book.get("cover") or "").replace("/s_", "/t7_")
             bookId = book.get("bookId")
             author = book.get("author") or ""
             if not bookId:
+                continue
+            if sort <= latest_sort:
+                page_id = unfinished_page_ids.get(str(bookId))
+                if page_id:
+                    update_existing_read_info(page_id, bookId)
+                    print(f"已刷新 {title} 的阅读状态和进度。")
                 continue
             categories = book.get("categories")
             if categories != None:
