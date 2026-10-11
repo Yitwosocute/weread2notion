@@ -106,6 +106,35 @@ class SyncRefreshTests(unittest.TestCase):
         self.assertEqual(0.9, reading["阅读进度"])
         self.assertNotIn("时间", reading)
 
+    def test_weread_gateway_auto_updates_skill_version_on_upgrade_info(self):
+        first_resp = Mock()
+        first_resp.raise_for_status = Mock()
+        first_resp.json.return_value = {
+            "upgrade_info": {
+                "latest_version": "1.0.6",
+                "current_version": "1.0.5",
+            }
+        }
+        second_resp = Mock()
+        second_resp.raise_for_status = Mock()
+        second_resp.json.return_value = {"books": [], "hasMore": 0}
+
+        session = Mock()
+        session.post.side_effect = [first_resp, second_resp]
+
+        with patch.object(cli.requests, "Session", return_value=session), patch("builtins.print"):
+            client = cli.WeReadGatewayClient("wrk-testkey123456")
+            self.assertEqual("1.0.5", client.skill_version)
+            result = client.request("/user/notebooks", count=100)
+
+        self.assertEqual({"books": [], "hasMore": 0}, result)
+        self.assertEqual("1.0.6", client.skill_version)
+        self.assertEqual(2, session.post.call_count)
+        self.assertEqual(
+            "1.0.6",
+            session.post.call_args_list[1].kwargs["json"]["skill_version"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

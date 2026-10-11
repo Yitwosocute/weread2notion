@@ -35,7 +35,7 @@ weread = None
 load_dotenv()
 WEREAD_URL = "https://weread.qq.com/"
 WEREAD_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
-WEREAD_SKILL_VERSION = "1.0.4"
+WEREAD_SKILL_VERSION = "1.0.5"
 NOTION_VERSION = "2026-03-11"
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
@@ -136,6 +136,7 @@ class WeReadGatewayClient:
     def __init__(self, api_key):
         if not api_key:
             fail_config("没有找到 WEREAD_API_KEY，请在 GitHub Actions Secrets 中配置")
+        self.skill_version = WEREAD_SKILL_VERSION
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -148,12 +149,26 @@ class WeReadGatewayClient:
     def request(self, api_name, **kwargs):
         payload = {
             "api_name": api_name,
-            "skill_version": WEREAD_SKILL_VERSION,
+            "skill_version": self.skill_version,
             **kwargs,
         }
         response = self.session.post(WEREAD_GATEWAY_URL, json=payload, timeout=30)
         response.raise_for_status()
         data = response.json()
+        upgrade_info = data.get("upgrade_info")
+        if isinstance(upgrade_info, dict):
+            latest_version = upgrade_info.get("latest_version")
+            if latest_version and latest_version != self.skill_version:
+                print(
+                    f"检测到微信读书 skill 新版本 {latest_version}（当前 {self.skill_version}），自动更新版本号重试..."
+                )
+                self.skill_version = latest_version
+                payload["skill_version"] = self.skill_version
+                response = self.session.post(
+                    WEREAD_GATEWAY_URL, json=payload, timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
         if data.get("upgrade_info"):
             raise Exception(f"微信读书 skill 需要升级: {data.get('upgrade_info')}")
         if data.get("errcode", 0) != 0:
